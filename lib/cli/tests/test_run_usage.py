@@ -708,3 +708,24 @@ def test_a_project_env_opt_out_covers_a_failed_script(
 
     assert crewai_run().exit_code == 0
     assert usage == []
+
+
+@pytest.mark.parametrize("inputs", ['{"messages":"hello"}', '{}', 'not-json'])
+def test_agent_run_counts_its_own_kind(project, usage, commands, inputs) -> None:
+    write(
+        project / "pyproject.toml",
+        CREW_PYPROJECT.replace('type = "crew"', 'type = "agent"'),
+    )
+    write(project / "uv.lock", "")
+    (project / ".venv").mkdir()
+
+    result = crewai_run("--inputs", inputs)
+
+    if inputs == '{"messages":"hello"}':
+        assert result.exit_code == 0, result.output
+        assert usage == [started("agent")]
+        assert commands
+    else:
+        assert result.exit_code == (2 if inputs == '{}' else 1)
+        assert usage == [started("agent"), stopped("invalid_inputs")]
+        assert not commands

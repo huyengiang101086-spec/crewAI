@@ -48,7 +48,7 @@ Install the full CrewAI package:
 
 The quotes are required in zsh so `crewai[tools]` is not treated as a glob.
 """
-_JSON_CREW_RUNNER_CODE = """
+_PROJECT_RUNNER_BOOTSTRAP_CODE = """
 import importlib.util
 import json
 import os
@@ -60,7 +60,7 @@ if source_dir:
     sys.path.insert(0, source_dir)
 
 # This interpreter never imports cli.py, so pin the machine's proxy and CA for
-# AMP requests here, before _run_json_crew loads the project's .env. A
+# AMP requests here, before the selected runner loads the project's .env. A
 # crewai-core too old to have plus_api pins nothing and ignores proxies anyway;
 # any other import failure is real and must surface here. `python -c` puts the
 # project folder first on sys.path, so the pin is imported with it off the path:
@@ -89,16 +89,30 @@ package = importlib.util.module_from_spec(package_spec)
 sys.modules["crewai_cli"] = package
 package_spec.loader.exec_module(package)
 
-module_path = package_dir / "run_crew.py"
-module_spec = importlib.util.spec_from_file_location("crewai_cli.run_crew", module_path)
+module_path = package_dir / f"{_runner_module}.py"
+module_spec = importlib.util.spec_from_file_location(f"crewai_cli.{_runner_module}", module_path)
 if module_spec is None or module_spec.loader is None:
     raise ImportError(f"Cannot load CrewAI CLI runner from {module_path}")
 
 module = importlib.util.module_from_spec(module_spec)
-sys.modules["crewai_cli.run_crew"] = module
+sys.modules[f"crewai_cli.{_runner_module}"] = module
 module_spec.loader.exec_module(module)
 
-from crewai_core.constants import CREWAI_TRAINED_AGENTS_FILE_ENV
+""".strip()
+
+
+def _project_runner_code(module_name: str, invocation: str) -> str:
+    return (
+        f"_runner_module = {module_name!r}\n"
+        + _PROJECT_RUNNER_BOOTSTRAP_CODE
+        + "\n"
+        + invocation.strip()
+    )
+
+
+_JSON_CREW_RUNNER_CODE = _project_runner_code(
+    "run_crew",
+    """from crewai_core.constants import CREWAI_TRAINED_AGENTS_FILE_ENV
 
 kwargs = {
     "trained_agents_file": os.getenv(CREWAI_TRAINED_AGENTS_FILE_ENV),
@@ -113,7 +127,8 @@ try:
 except module.click.ClickException as exc:
     exc.show()
     raise SystemExit(exc.exit_code)
-""".strip()
+""",
+)
 
 
 def _is_missing_crewai_package(exc: ModuleNotFoundError) -> bool:
@@ -433,8 +448,8 @@ def _has_project_venv(project_root: Path | None = None) -> bool:
     return (root / ".venv").is_dir()
 
 
-def _install_json_crew_dependencies_if_needed() -> None:
-    """Prepare JSON crew dependencies without mutating existing lockfiles."""
+def _install_project_dependencies_if_needed() -> None:
+    """Prepare project dependencies without mutating existing lockfiles."""
     project_root = Path.cwd()
     if not (project_root / "pyproject.toml").is_file():
         return
@@ -470,11 +485,13 @@ def _find_local_crewai_source_dir() -> Path | None:
     return None
 
 
-def _json_crew_run_command(project_root: Path | None = None) -> list[str]:
-    """Return the project-environment command for running JSON crews."""
+def _project_run_command(
+    runner_code: str, project_root: Path | None = None
+) -> list[str]:
+    """Return a runner command using the project environment."""
     if _uses_poetry_lockfile(project_root):
-        return ["poetry", "run", "python", "-c", _JSON_CREW_RUNNER_CODE]
-    return ["uv", "run", "--no-sync", "python", "-c", _JSON_CREW_RUNNER_CODE]
+        return ["poetry", "run", "python", "-c", runner_code]
+    return ["uv", "run", "--no-sync", "python", "-c", runner_code]
 
 
 def _run_json_crew_in_project_env(
@@ -496,9 +513,9 @@ def _run_json_crew_in_project_env(
         )
 
     with stops_run_as("install_failed"):
-        _install_json_crew_dependencies_if_needed()
+        _install_project_dependencies_if_needed()
 
-    command = _json_crew_run_command()
+    command = _project_run_command(_JSON_CREW_RUNNER_CODE)
     env = build_env_with_all_tool_credentials()
     env[_CREWAI_CLI_RUNNER_PACKAGE_DIR_ENV] = str(Path(__file__).resolve().parent)
     if local_crewai_source_dir := _find_local_crewai_source_dir():
@@ -559,7 +576,7 @@ def _count_usage(feature: str) -> None:
 
 # The project type `crewai run` dispatched on; `unknown` when no readable
 # pyproject.toml said which.
-RunKind = Literal["crew", "json_crew", "flow", "declarative_flow", "unknown"]
+RunKind = Literal["crew", "json_crew", "flow", "declarative_flow", "agent", "unknown"]
 
 # Where `crewai run` stopped before the crew or flow kicked off; except
 # `script_failed`, a Python project's `uv run` script that exited non-zero,
@@ -659,6 +676,8 @@ def _run_kind(pyproject_data: dict[str, Any]) -> RunKind:
     project_type = config.get("type")
     if project_type == "flow":
         return "declarative_flow" if "definition" in config else "flow"
+    if project_type == "agent":
+        return "agent"
     if project_type == "crew" and "definition" in config:
         return "json_crew"
     return "crew"
@@ -871,7 +890,7 @@ def run_crew(
     definition: str | None = None,
     inputs: str | None = None,
 ) -> None:
-    """Run the crew or flow.
+    """Run the crew, flow, or standalone agent.
 
     Args:
         trained_agents_file: Optional path to a trained-agents pickle produced
@@ -879,9 +898,10 @@ def run_crew(
             ``CREWAI_TRAINED_AGENTS_FILE`` so agents load suggestions from this
             file instead of the default ``trained_agents_data.pkl``.
         definition: Optional path to a declarative Flow definition.
-        inputs: Optional JSON object of runtime inputs for a declarative flow
-            or declarative (JSON) crew. Layered over the definition's own
-            defaults; missing required values are prompted for interactively.
+        inputs: Optional JSON object of runtime inputs for an agent, declarative
+            flow or declarative (JSON) crew. Agent projects require ``messages``.
+            Declarative inputs layer over defaults and prompt for missing values
+            interactively.
     """
     # --definition is a pure override: run that flow directly.
     if definition is not None:
@@ -936,6 +956,15 @@ def run_crew(
             trained_agents_file=trained_agents_file,
             inputs=inputs,
         )
+        return
+
+    if project_type == "agent":
+        if trained_agents_file is not None:
+            record_run_stopped("unsupported_option")
+            raise click.UsageError("--filename can only be used when running crews")
+        from crewai_cli.run_agent import run_agent_in_project_env
+
+        run_agent_in_project_env(inputs)
         return
 
     _reject_inputs_for_non_flow(inputs)
